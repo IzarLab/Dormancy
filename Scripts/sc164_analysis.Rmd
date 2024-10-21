@@ -1,0 +1,961 @@
+---
+title: "sc164"
+output: html_document
+date: "2024-05-10"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+create_boxplots_separate_pages <- function(seurat_list, sample, celltype_scores) {
+  for (score in celltype_scores) {
+    # Extract cell type scores
+    celltype_data <- seurat_list[[sample]]@meta.data[, c(score, "seurat_clusters")]
+    
+    # Reshape data for ggplot
+    celltype_data_long <- reshape2::melt(celltype_data, id.vars = "seurat_clusters")
+    
+    # Calculate medians by cluster
+    median_data <- aggregate(value ~ seurat_clusters, data = celltype_data_long, FUN = median)
+    median_data <- median_data[order(median_data$value, decreasing = TRUE), ]  # Order by median
+    
+    # Reorder factor levels based on median values
+    celltype_data_long$seurat_clusters <- factor(celltype_data_long$seurat_clusters, levels = median_data$seurat_clusters)
+   
+    # Create box plot
+    p <- ggplot(celltype_data_long, aes(x = factor(seurat_clusters), y = value)) +
+      geom_boxplot() +
+      labs(x = "Cluster", y = "Celltype Score", title = score) +
+      theme_minimal()
+    
+    # Save plot to separate file
+
+    print(p)
+
+  }
+}
+
+library(stringi)
+library(dplyr)
+library(readxl)
+library(fields)
+library(KernSmooth)
+library(DoubletFinder)
+library(scCustomize)
+library(openxlsx)
+library(gplots)
+library(ggplot2)
+library(ggrastr)
+library(DropletUtils)
+library(SingleR)
+library(RColorBrewer)
+library(ROCR)
+library(parallel)
+library(miloR)
+library(celldex)
+library(SingleCellExperiment)
+library(scater)
+library(pheatmap)
+library(Matrix)
+library(stringi)
+library(Seurat)
+library(patchwork)
+library(beeswarm)
+library(rstatix)
+library(ggprism)
+library(magrittr)
+library(ggpubr)
+library(statmod)
+library(tibble)
+
+# Create the dataframe
+doublet_rate_df <- data.frame(
+  multiple_rate = c(0.40, 0.80, 1.60, 2.30, 3.10, 3.90, 4.60, 5.40, 6.10, 6.90, 7.60),
+  cells_loaded = c(800, 1600, 3200, 4800, 6400, 8000, 9600, 11200, 12800, 14400, 16000),
+  cells_recovered = c(500, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000)
+)
+
+samples <- c("SC164_6", "SC164_10")
+seurat_list = list()
+doublet_rate <- list()
+for (sample in samples){
+  cell_bender_mat <- Read_CellBender_h5_Mat(file_name = paste0("/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/", sample, "/feature_bc_matrix_bent_filtered.h5"))
+  
+  ### Initialize the Seurat object with the raw (non-normalized data)
+  seurat_list[[sample]] <- CreateSeuratObject(counts = cell_bender_mat, 
+                              min.cells = 3, min.features = 300)
+
+  # Annotate MT genes
+  seurat_list[[sample]]$percent.mt <- PercentageFeatureSet(object = seurat_list[[sample]], pattern = "^mt-")
+  
+  # Annotate
+  seurat_list[[sample]]$sample<-sample
+  seurat_list[[sample]]$barcode_orig<-rownames(seurat_list[[sample]]@meta.data)
+
+  # Get the doublet_rate value
+  doublet_rate[[sample]] <- doublet_rate_df$multiple_rate[which.min(abs(doublet_rate_df$cells_recovered - dim(seurat_list[[sample]]@assays$RNA)[2]))]*0.01
+  
+  rownames(seurat_list[[sample]]@meta.data)<-seurat_list[[sample]]$barcode_orig
+  
+  
+  ### subset 
+  minFeature<-200
+  maxFeature<- 12000
+  minCount<- 800
+  maxCount<- 70000
+  maxMT<-15
+  
+  seurat_list[[sample]] <- subset(seurat_list[[sample]], subset = nFeature_RNA > minFeature & nFeature_RNA < maxFeature & 
+                  nCount_RNA > minCount & nCount_RNA < maxCount & 
+                  percent.mt < maxMT)
+}
+
+#Normalize
+for (sample in samples){
+  seurat_list[[sample]] <- NormalizeData(seurat_list[[sample]])
+  seurat_list[[sample]] <- FindVariableFeatures(seurat_list[[sample]])
+  seurat_list[[sample]] <- ScaleData(seurat_list[[sample]])
+  seurat_list[[sample]] <- RunPCA(seurat_list[[sample]])
+  ElbowPlot(seurat_list[[sample]], ndims = 50)
+}
+```
+
+
+### Doublet Removal
+
+```{r error=FALSE, message=FALSE, warning=FALSE, results=FALSE}
+# Find optimal pK for doubletFinder function
+sweep.list <- list()
+sweep.stats <- list()
+for (sample in samples){
+  sweep.list[[sample]] <- paramSweep(seurat_list[[sample]], PCs = 1:30)
+  sweep.stats[[sample]] <- summarizeSweep(sweep.list[[sample]])
+}
+
+```
+
+```{r include=FALSE}
+bcmvn <- list()
+for (sample in samples){
+  bcmvn[[sample]] <- find.pK(sweep.stats[[sample]])
+}
+
+```
+
+```{r error=FALSE, message=FALSE, warning=FALSE, results=FALSE}
+
+for (sample in samples){
+  pK <- bcmvn[[sample]] %>% 
+    dplyr::filter(BCmetric == max(BCmetric)) %>%
+    dplyr::select(pK) 
+  pK <- as.numeric(as.character(pK[[1]]))
+  
+  seurat_list[[sample]] <- FindNeighbors(seurat_list[[sample]], dims = 1:30)
+  seurat_list[[sample]] <- FindClusters(seurat_list[[sample]], resolution = 0.5)
+  
+  ## Homotypic doublet proportion estimate
+  annotations <- seurat_list[[sample]]@meta.data$seurat_clusters
+  homotypic.prop <- modelHomotypic(annotations) 
+  nExp.poi <- round(doublet_rate[[sample]] * nrow(seurat_list[[sample]]@meta.data)) 
+  nExp.poi.adj <- round(nExp.poi * (1 - homotypic.prop))
+  
+  # Run doubletFinder
+  seurat_list[[sample]] <- doubletFinder(seurat_list[[sample]], PCs = 1:30, pN = 0.25, pK = pK, nExp = nExp.poi.adj, reuse.pANN = FALSE)
+  
+
+}
+
+for (sample in samples){
+  metadata <- seurat_list[[sample]]@meta.data
+  colnames(metadata)[10] <- "doublet_finder"
+  seurat_list[[sample]]@meta.data <- metadata
+  
+  # visualize doublets
+  seurat_list[[sample]] <- RunUMAP(seurat_list[[sample]], dims = 1:30)
+  print(DimPlot(seurat_list[[sample]], reduction = 'umap', group.by = "doublet_finder"))
+  
+  # number of singlets and doublets
+  table(seurat_list[[sample]]@meta.data$doublet_finder)
+  predicted_doublets <- table(seurat_list[[sample]]@meta.data$doublet_finder)['Doublet']
+
+  # subset and save
+  data.singlets <- subset(seurat_list[[sample]], doublet_finder == "Singlet")
+  seurat_list[[sample]] <- data.singlets
+  remove(data.singlets)
+}
+
+for (sample in samples){
+  print(sample)
+  print(paste("medgenes", median(seurat_list[[sample]]$nFeature_RNA)))
+  print(paste("meanreads", mean(seurat_list[[sample]]$nCount_RNA)))
+  print(paste("ncells", length(rownames(seurat_list[[sample]]@meta.data))))
+  print(DimPlot(seurat_list[[sample]], reduction = "umap"))
+}
+
+```
+
+### Celltype Annotation
+
+
+```{r}
+excel_file <- "/Users/zackbrodtman/Documents/jobwork/CUIMC/Useful notes/Mouse_Signatures_Combined.xlsx"
+sheet_names <- excel_sheets(excel_file)
+
+# Create an empty list to store data frames
+signatures <- list()
+
+# Loop through each sheet and read it into R
+for (sheet in sheet_names) {
+  signatures[[sheet]] <- read_excel(excel_file, sheet = sheet)
+}
+
+for (sample in samples){
+  for (i in seq(length(signatures))){
+    for (j in seq(length(signatures[[i]]))){
+      type <- colnames(signatures[[i]][j])
+      gene_list <- c(signatures[[i]][j][[1]])
+      gene_list <- gene_list[!is.na(gene_list) & gene_list != ""]
+      if (length(gene_list[gene_list %in% rownames(seurat_list[[sample]]@assays$RNA$counts)])>0){
+          seurat_list[[sample]] <-  AddModuleScore(object = seurat_list[[sample]], features = gene_list[gene_list %in% rownames(seurat_list[[sample]]@assays$RNA$counts)], name = paste0(type, "_Score"))
+      }
+    }
+  }
+  columns_to_keep <- c("orig.ident", "nCount_RNA", "nFeature_RNA", 
+                     "percent.mt", "barcode_orig", "RNA_snn_res.0.5",
+                     "seurat_clusters", 
+                     grep("_Score1$", colnames(seurat_list[[sample]]@meta.data), value = TRUE))
+  seurat_list[[sample]]@meta.data <- seurat_list[[sample]]@meta.data[, columns_to_keep]
+}
+
+# singleR
+seu_sce <- list()
+for (sample in samples){
+  seu_sce[[sample]] <- as.SingleCellExperiment(seurat_list[[sample]])
+  
+  mouse_ref<-MouseRNAseqData()
+  pred_main <- SingleR(test = seu_sce[[sample]], ref = mouse_ref, labels = mouse_ref$label.main)
+  pruneScores(pred_main)
+  seurat_list[[sample]][['celltype_main']]<-pred_main$pruned.labels
+  
+  pred_fine <- SingleR(test = seu_sce[[sample]], ref = mouse_ref, labels = mouse_ref$label.fine)
+  pruneScores(pred_fine)
+  seurat_list[[sample]][['celltype_fine']]<-pred_fine$pruned.labels
+  
+}
+
+
+pdf("/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/SC164_initial_signatures.pdf")
+for (sample in samples){
+  print(DimPlot(seurat_list[[sample]], reduction = "umap",label = T,group.by = 'ident',raster = T,shuffle = T, label.size = 2.5, pt.size = 2.5) + theme(legend.position="bottom")+ggtitle(paste0(sample))
+)
+  for (score in c(colnames(seurat_list[[sample]]@meta.data)[10:length(colnames(seurat_list[[sample]]@meta.data))-2])){
+    print(FeaturePlot(object = seurat_list[[sample]], features = score)+ggtitle(paste0(score, " for ", sample)))
+  }
+  
+  print(DimPlot(seurat_list[[sample]], reduction = "umap",label = T,group.by = 'celltype_fine',repel = T,label.size = 2.5,raster = T,shuffle = T) + 
+  guides(col = guide_legend(nrow = 30,override.aes = list(size=5))) +
+  theme(legend.text=element_text(size=6)))
+  
+  print(DimPlot(seurat_list[[sample]], reduction = "umap",label = T,group.by = 'celltype_main',repel = T,label.size = 2.5,raster = T,shuffle = T) + 
+  guides(col = guide_legend(nrow = 30,override.aes = list(size=5))) +
+  theme(legend.text=element_text(size=6)))
+
+}
+dev.off()
+
+cluster.ids <- list()
+cluster.ids[[6]] <- c("B Cells", "Myeloid", "Myeloid", "T Cells", "T Cells", "T Cells", "T Cells", "B Cells", "Myeloid", "T Cells", "Myeloid", "B Cells", "Myeloid", "Myeloid", "Myeloid")
+cluster.ids[[10]] <- c("B Cells", "Myeloid", "T Cells", "Myeloid", "T Cells", "B Cells", "Myeloid", "T Cells", "Myeloid", "Myeloid", "Myeloid", "T Cells", "Myeloid", "Myeloid", "Myeloid")
+
+
+names(cluster.ids[[6]]) <- levels(seurat_list[["SC164_6"]])
+seurat_list[["SC164_6"]] <- RenameIdents(seurat_list[["SC164_6"]], cluster.ids[[6]])
+seurat_list[["SC164_6"]]$celltype <- Idents(seurat_list[["SC164_6"]])
+saveRDS(seurat_list[["SC164_6"]], paste0("/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/", "SC164_6", ".rds"))
+
+names(cluster.ids[[10]]) <- levels(seurat_list[["SC164_10"]])
+seurat_list[["SC164_10"]] <- RenameIdents(seurat_list[["SC164_10"]], cluster.ids[[10]])
+seurat_list[["SC164_10"]]$celltype <- Idents(seurat_list[["SC164_10"]])
+saveRDS(seurat_list[["SC164_10"]], paste0("/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/", "SC164_10", ".rds"))
+
+
+
+for (sample in samples){
+  print(table(seurat_list[[sample]]$celltype))
+}
+
+```
+
+
+### Post inferCNV
+
+
+```{r}
+seurat_list = list()
+for (sample in samples){
+  seurat_list[[sample]] <- readRDS(paste0("/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/", sample, ".rds"))
+}
+
+for (sample in samples){
+  seurat_list[[sample]]$sample <- sample
+  print(DimPlot(seurat_list[[sample]], reduction='umap', group.by = "celltype"))
+}
+
+```
+
+### Integration
+
+```{r}
+# Merge
+
+
+#seu_merged <-  merge(seurat_list[["SC78_1"]], y = c(seurat_list[["SC78_2"]], seurat_list[["SC78_4"]], seurat_list[["SC78_5"]], seurat_list[["SC78_6"]], seurat_list[["SC78_8"]], seurat_list[["SC78_9"]]),
+#                         add.cell.ids = c("1", "2", "4", "5", "6", "8", "9"))
+#seu_merged <- JoinLayers(seu_merged)
+
+
+features <- SelectIntegrationFeatures(object.list = seurat_list)
+anchors <- FindIntegrationAnchors(object.list = seurat_list, anchor.features = features)
+SC78_combined <- IntegrateData(anchorset = anchors)
+
+DefaultAssay(SC78_combined) <- "integrated"
+
+# Run the standard workflow for visualization and clustering
+SC78_combined <- ScaleData(SC78_combined, verbose = FALSE)
+SC78_combined <- RunPCA(SC78_combined, npcs = 30, verbose = FALSE)
+SC78_combined <- RunUMAP(SC78_combined, reduction = "pca", dims = 1:30)
+SC78_combined <- FindNeighbors(SC78_combined, reduction = "pca", dims = 1:30)
+SC78_combined <- FindClusters(SC78_combined, resolution = 0.5)
+
+DimPlot(SC78_combined, reduction = "umap", group.by = "celltype")
+
+
+#SC78_combined$major_celltype <- recode(SC78_combined$major_celltype, "Myeliod" = "Myeloid")
+
+#seu_merged$orig.ident <- seu_merged$sample
+#table(seu_merged$orig.ident)
+
+# Find integration anchors
+#LKB1.anchors <- FindIntegrationAnchors(object.list = seurat_list,  reduction = "cca", dims = 1:30)
+#LKB1.anchors <- readRDS("LKB1.anchors")
+#SC78_integrated <- IntegrateData(anchorset = LKB1.anchors,dims=1:30)
+#saveRDS(LKB1.anchors, "/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/integration/SC78.anchors.rds")
+#saveRDS(SC78_integrated, "/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/integration/SC78_integrated.rds")
+
+#obj <- SC78_integrated
+#obj <- ScaleData(obj)
+#obj <- RunPCA(obj)
+#ElbowPlot(obj, ndims = 50)
+
+
+columns_to_keep <- c("orig.ident", "sample", "nCount_RNA", "nFeature_RNA", 
+                     "percent.mt", "barcode_orig", "seurat_clusters", "celltype")
+          
+SC78_combined@meta.data <-SC78_combined@meta.data[, columns_to_keep]
+#obj@meta.data <-obj@meta.data[, columns_to_keep]
+
+# unsupervised clustering & umap
+
+#obj <- RunUMAP(obj, reduction = "pca", dims = 1:30)
+#obj <- FindNeighbors(obj, reduction = "pca", dims = 1:30)
+#obj <- FindClusters(obj, resolution = 0.5, cluster.name = "cca_clusters")
+
+DimPlot(
+  SC78_combined,
+  reduction = "umap",
+  group.by = c("sample", "celltype"),
+  combine = FALSE, label.size = 2
+)
+
+DimPlot(
+  SC78_combined,
+  reduction = "pca",
+  group.by = c("sample", "celltype"),
+  combine = FALSE, label.size = 2
+)
+
+ggplot(SC78_combined@meta.data, aes(x=seurat_clusters, fill=sample)) + geom_bar(position = "fill") + ggtitle('Sample mixing after CCA integration')
+
+DimPlot(SC78_combined, label = T)
+
+DimPlot(SC78_combined, group.by = "celltype")
+
+```
+
+
+```{r}
+DefaultAssay(SC78_combined) <- "RNA"
+SC78_combined.joined <- JoinLayers(SC78_combined)
+integrated_list <- list()
+integrated_list[["nonmalig"]] <- subset(SC78_combined.joined, subset = celltype!="malignant")
+
+ints <- c("nonmalig")
+
+for (i in ints){
+  integrated_list[[i]] <- NormalizeData(integrated_list[[i]])
+  integrated_list[[i]] <- FindVariableFeatures(integrated_list[[i]])
+  integrated_list[[i]] <- ScaleData(integrated_list[[i]])
+  integrated_list[[i]] <- RunPCA(integrated_list[[i]])
+  integrated_list[[i]] <- FindNeighbors(integrated_list[[i]], dims = 1:30)
+  integrated_list[[i]] <- FindClusters(integrated_list[[i]], resolution = 0.5)
+  integrated_list[[i]] <- RunUMAP(integrated_list[[i]], dims = 1:30)
+}
+
+```
+
+### immune signatures
+
+```{r}
+sample = "nonmalig"
+for (i in seq(length(signatures))){
+    for (j in seq(length(signatures[[i]]))){
+      type <- colnames(signatures[[i]][j])
+      gene_list <- c(signatures[[i]][j][[1]])
+      gene_list <- gene_list[!is.na(gene_list) & gene_list != ""]
+      if (length(gene_list[gene_list %in% rownames(integrated_list[[sample]]@assays$RNA$counts)])>0){
+          integrated_list[[sample]] <-  AddModuleScore(object = integrated_list[[sample]], features = gene_list[gene_list %in% rownames(integrated_list[[sample]]@assays$RNA$counts)], name = paste0(type, "_Score"))
+      }
+    }
+}
+
+columns_to_keep <- c("sample", "nCount_RNA", "nFeature_RNA", 
+                     "percent.mt", "barcode_orig", "RNA_snn_res.0.5",
+                     "seurat_clusters", "celltype",
+                     grep("_Score1$", colnames(integrated_list[[sample]]@meta.data), value = TRUE))
+integrated_list[[sample]]@meta.data <- integrated_list[[sample]]@meta.data[, columns_to_keep]
+
+# singleR
+seu_sce <- list()
+
+seu_sce[[sample]] <- as.SingleCellExperiment(integrated_list[[sample]])
+
+mouse_ref<-MouseRNAseqData()
+pred_main <- SingleR(test = seu_sce[[sample]], ref = mouse_ref, labels = mouse_ref$label.main)
+pruneScores(pred_main)
+integrated_list[[sample]][['celltype_main']]<-pred_main$pruned.labels
+
+pred_fine <- SingleR(test = seu_sce[[sample]], ref = mouse_ref, labels = mouse_ref$label.fine)
+pruneScores(pred_fine)
+integrated_list[[sample]][['celltype_fine']]<-pred_fine$pruned.labels
+  
+
+
+
+pdf("/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/SC164_nonmalig_signatures2.pdf")
+
+print(DimPlot(integrated_list[[sample]], reduction = "umap",label = T,group.by = 'ident',raster = T,shuffle = T, label.size = 2.5, pt.size = 2.5) + theme(legend.position="bottom")+ggtitle(paste0(sample))
+)
+for (score in c(colnames(integrated_list[[sample]]@meta.data)[11:length(colnames(integrated_list[[sample]]@meta.data))-2])){
+  print(FeaturePlot(object = integrated_list[[sample]], features = score)+ggtitle(paste0(score, " for ", sample)))
+}
+
+print(DimPlot(integrated_list[[sample]], reduction = "umap",label = T,group.by = 'celltype_fine',repel = T,label.size = 2.5,raster = T,shuffle = T) + 
+guides(col = guide_legend(nrow = 30,override.aes = list(size=5))) +
+theme(legend.text=element_text(size=6)))
+
+print(DimPlot(integrated_list[[sample]], reduction = "umap",label = T,group.by = 'celltype_main',repel = T,label.size = 2.5,raster = T,shuffle = T) + 
+guides(col = guide_legend(nrow = 30,override.aes = list(size=5))) +
+theme(legend.text=element_text(size=6)))
+dev.off()
+
+cluster.names <- c("B Cells", "Myeloid", "T Cells", "T Cells", "T Cells", "B Cells", "T Cells", "Myeloid", "Myeloid", "T Cells", "B Cells", "B Cells", "Myeloid", "Myeloid", "Myeloid", "T Cells")
+
+
+names(cluster.names) <- levels(integrated_list[["nonmalig"]])
+integrated_list[["nonmalig"]] <- RenameIdents(integrated_list[["nonmalig"]], cluster.names)
+integrated_list[["nonmalig"]]$major_celltype_final <- Idents(integrated_list[["nonmalig"]])
+saveRDS(integrated_list[["nonmalig"]], paste0("/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/SC164_nonmalignant.rds"))
+
+
+print(table(integrated_list[["nonmalig"]]$celltype))
+print(table(integrated_list[["nonmalig"]]$major_celltype_final))
+
+
+SC78_combined.joined@meta.data$major_celltypes_final <- "Malignant"
+
+# Identify the common cell names between the two dataframes
+common_cells <- intersect(rownames(integrated_list[["nonmalig"]]@meta.data), rownames(SC78_combined.joined@meta.data))
+
+# Update the celltypes for common cells
+SC78_combined.joined@meta.data[c(common_cells), 'major_celltypes_final'] <- as.character(integrated_list[["nonmalig"]]@meta.data[c(common_cells), 'major_celltype_final'])
+DimPlot(SC78_combined.joined, reduction = "umap", group.by = 'celltype')
+DimPlot(SC78_combined.joined, reduction = "umap", group.by = 'major_celltypes_final')
+
+saveRDS(SC78_combined.joined, '/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/SC164_integration_with_celltypes.rds')
+saveRDS(integrated_list[["nonmalig"]], '/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/SC164_nonmalignant_finalseu.rds')
+
+```
+
+
+### immune subclustering
+
+```{r}
+group_mapping <- c("SC164_6" = "4T1_Con",
+                   "SC164_10" = "4T1_shPTK2")
+
+# Add group information to ID_major column
+SC78_combined.joined@meta.data$ID_major <- group_mapping[SC78_combined.joined@meta.data$sample] 
+table(SC78_combined.joined$major_celltypes_final)
+
+
+
+immuneseu <- subset(SC78_combined.joined, subset = major_celltypes_final!='Malignant')
+
+samples <- c("B Cells", "Myeloid", "T Cells")
+
+
+seurat_list <- list()
+for(sample in samples){
+  seurat_obj <- subset(immuneseu, subset = major_celltypes_final == sample[1])
+  seurat_list[[sample]] <- CreateSeuratObject(counts = seurat_obj@assays$RNA$counts, 
+                              min.cells = 3, min.features = 1, meta.data = seurat_obj@meta.data["sample"])
+  seurat_list[[sample]]$percent.mt <- PercentageFeatureSet(object = seurat_list[[sample]], pattern = "^MT-")
+  seurat_list[[sample]]$barcode_orig <- rownames(seurat_list[[sample]]@meta.data)
+
+  seurat_list[[sample]] <- subset(seurat_list[[sample]], subset = nFeature_RNA > minFeature & nFeature_RNA < maxFeature & 
+                nCount_RNA > minCount & nCount_RNA < maxCount & 
+                percent.mt < maxMT)
+  seurat_list[[sample]] <- NormalizeData(seurat_list[[sample]])
+  seurat_list[[sample]] <- FindVariableFeatures(seurat_list[[sample]])
+  seurat_list[[sample]] <- ScaleData(seurat_list[[sample]])
+  seurat_list[[sample]] <- RunPCA(seurat_list[[sample]])
+  
+  seurat_list[[sample]] <- RunUMAP(seurat_list[[sample]], dims = 1:30)
+  seurat_list[[sample]] <- FindNeighbors(seurat_list[[sample]], dims = 1:30)
+  seurat_list[[sample]] <- FindClusters(seurat_list[[sample]], resolution = 0.5)
+  
+  #seurat_obj@meta.data$barcode_orig <- rownames(seurat_obj@meta.data)
+  #sampleinfo = seurat_obj@meta.data[c('sample', 'barcode_orig', 'ID_major')]
+  #seurat_list[[sample]]@meta.data <- merge(seurat_list[[sample]]@meta.data, sampleinfo, by = 'barcode_orig')
+  
+  seu_sce[[sample]] <- as.SingleCellExperiment(seurat_list[[sample]])
+  
+  mouse_ref<-MouseRNAseqData()
+  pred_main <- SingleR(test = seu_sce[[sample]], ref = mouse_ref, labels = mouse_ref$label.main)
+  pruneScores(pred_main)
+  seurat_list[[sample]][['celltype_main']]<-pred_main$pruned.labels
+  
+  pred_fine <- SingleR(test = seu_sce[[sample]], ref = mouse_ref, labels = mouse_ref$label.fine)
+  pruneScores(pred_fine)
+  seurat_list[[sample]][['celltype_fine']]<-pred_fine$pruned.labels
+  
+  if (sample == "B Cells"){
+    for (j in seq(length(signatures[['BCells']]))){
+      type <- colnames(signatures[["BCells"]][j])
+      gene_list <- c(signatures[["BCells"]][j][[1]])
+      gene_list <- gene_list[!is.na(gene_list) & gene_list != ""]
+      if (length(gene_list[gene_list %in% rownames(seurat_list[[sample]]@assays$RNA$counts)])>0){
+          seurat_list[[sample]] <-  AddModuleScore(object = seurat_list[[sample]], features = gene_list[gene_list %in% rownames(seurat_list[[sample]]@assays$RNA$counts)], name = paste0(type, "_Score"))
+      }
+    }
+  }
+  if (sample == "T Cells"){
+    for (j in seq(length(signatures[['TCells']]))){
+      type <- colnames(signatures[["TCells"]][j])
+      gene_list <- c(signatures[["TCells"]][j][[1]])
+      gene_list <- gene_list[!is.na(gene_list) & gene_list != ""]
+      if (length(gene_list[gene_list %in% rownames(seurat_list[[sample]]@assays$RNA$counts)])>0){
+          seurat_list[[sample]] <-  AddModuleScore(object = seurat_list[[sample]], features = gene_list[gene_list %in% rownames(seurat_list[[sample]]@assays$RNA$counts)], name = paste0(type, "_Score"))
+      }
+    }
+  }
+  if (sample == "Myeloid"){
+    for (j in seq(length(signatures[['Myeloid']]))){
+      type <- colnames(signatures[["Myeloid"]][j])
+      gene_list <- c(signatures[["Myeloid"]][j][[1]])
+      gene_list <- gene_list[!is.na(gene_list) & gene_list != ""]
+      if (length(gene_list[gene_list %in% rownames(seurat_list[[sample]]@assays$RNA$counts)])>0){
+          seurat_list[[sample]] <-  AddModuleScore(object = seurat_list[[sample]], features = gene_list[gene_list %in% rownames(seurat_list[[sample]]@assays$RNA$counts)], name = paste0(type, "_Score"))
+      }
+    }
+  }
+
+  seurat_list[[sample]]@meta.data$ID_major <- group_mapping[seurat_list[[sample]]@meta.data$sample] 
+  columns_to_keep <- c("orig.ident", "sample", "ID_major", "nCount_RNA", "nFeature_RNA", 
+                     "percent.mt", "barcode_orig", "RNA_snn_res.0.5",
+                     "seurat_clusters", "celltype_main", "celltype_fine",
+                     grep("_Score1$", colnames(seurat_list[[sample]]@meta.data), value = TRUE))
+  seurat_list[[sample]]@meta.data <- seurat_list[[sample]]@meta.data[, columns_to_keep]
+}
+
+# granulocyte sigs
+
+neutrophil_genes <- c("Ltf", "Camp", "Cd14")
+eosinophil_genes <- c("Siglece", "Ccr1", "Ifnar1", "Itga4")
+basophil_genes <- c(  "Cd9", "Cd22", "Cd36", "Fcgr2b")
+mast_genes <- c("Cxcr4", "Il10ra", "Ptger2")
+
+# Create a list to hold the signatures
+granulocyte_signatures <- list(
+  Neutrophils = neutrophil_genes,
+  Eosinophils = eosinophil_genes,
+  Basophils = basophil_genes,
+  Mast_Cells = mast_genes
+)
+
+max_length <- max(sapply(granulocyte_signatures, length))
+
+# Pad shorter gene lists with NA to ensure all columns have the same length
+padded_signatures <- lapply(granulocyte_signatures, function(genes) {
+  length(genes) <- max_length
+  genes
+})
+
+# Convert the list to a data frame
+signatures[["Granulocytes"]] <- as.data.frame(padded_signatures)
+DotPlot(seurat_list[["Myeloid"]], c('S100a6','S100a8','S100a9','S100a11','S100a13','Stat1'))
+DotPlot(seurat_list[["Myeloid"]], c('Stat3','Stat5b','Stat6','stat5','Irf1','Junb','C5ar1'))
+DotPlot(seurat_list[["Myeloid"]], c('Cd84','Ctsd','Clec4d','Clec4e','Il1f9','Gca'))
+DotPlot(seurat_list[["Myeloid"]], c('Limk2','Wfdc17','Dusp1','Selplg','Cxcr2'))
+DotPlot(seurat_list[["Myeloid"]], c('Xpo6','Nos2','Ifitm2','Anxa1','Ggt1'))
+
+
+DotPlot(seurat_list[["Myeloid"]], features = c("Lyz2", "Lcn2", "mt−Co1", "Calm2", "Arhgdib", "Ltf", "Ngp", "Hmgb2", "Hmgn2", "Camp", "H2afz", "Hmgb1", "Cebpe", "Chil3", "Tubb5", "Ube2s", "Ptma", "Tuba1b", "Stmn1", "Ube2c")
+)
+
+DotPlot(seurat_list[["Myeloid"]], features=  c("Ccr7", "Cd14", "Cd15", "Cd177", "Cd24", "Cd47", "Cd63", "Cd86", "Ceacam8", "Cxcr1", "Cxcr2", "Cxcr4", "Itgax", "Itgam", "Ly6g", "Sell"))
+
+DotPlot(seurat_list[["Myeloid"]], features= c('S100a6','S100a8','S100a9','S100a11','S100a13','Stat1','Stat3','Stat5b','Stat6','stat5','Irf1','Junb','C5ar1','Cd84','Ctsd','Clec4d','Clec4e','Il1f9','Gca','Limk2','Wfdc17','Dusp1','Selplg','Cxcr2','Xpo6','Nos2','Ifitm2','Anxa1','Ggt1'))
+
+DimPlot(seurat_list[["T Cells"]], group.by = "celltype")
+
+temp <- subset(seurat_list[['Myeloid']], (subset = ID_major == "4T1-WT-D20" )|(subset = ID_major =="4T07-WT-D20") )
+temp <- subset(temp, (subset = celltype == "Monocytes Apobec3a " )|(subset = celltype =="Monocytes")|(subset = celltype =="Monocytes CD14")|(subset = celltype =="Monocytes CD16")|(subset = celltype =="Monocytes Apobec3b") )
+table(temp$celltype)
+
+VlnPlot(temp, features = c("Ifnb1", "Ifnar1", "Ifnar2", "Il10rb", "Jak1", "Jak2"), group.by = 'celltype', split.by = 'ID_major', cols = c("red", "blue"))+ theme(legend.position = 'right')
+VlnPlot(temp, features = c("Tyk2", "Stat1", "Stat2", "Irf1", "Irf2", "Irf3", "Irf5"), group.by = 'celltype', split.by = 'ID_major', cols = c("red", "blue"))+ theme(legend.position = 'right')
+VlnPlot(temp, features = c("Irf7", "Irf9", "Ccl5", "Isg15", "Ifitm2", "Ifitm3", "Ifi213", "Oas1c", "Oas1d", "Ifitn1"), group.by = 'celltype', split.by = 'ID_major', cols = c("red", "blue"))+ theme(legend.position = 'right')
+
+for (i in seq(length(granulocyte_signatures))){
+  print(FeaturePlot(seurat_list[["Myeloid"]], features = granulocyte_signatures[[i]], pt.size =0.1)+ggtitle(names(granulocyte_signatures)[i]))
+}
+DimPlot(seurat_list[["Myeloid"]], group.by = 'celltype_fine')
+FeaturePlot(seurat_list[["Myeloid"]], features = c("Adgre1", "Mrc1", "Siglecf"))
+```
+
+
+
+# immune subclustering
+```{r}
+pdf(file = "/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/SC164_immune_subclustering_unsupervised_annotation.pdf")
+for (sample in samples){
+  print(DimPlot(seurat_list[[sample]], reduction = "umap",label = T,group.by = 'seurat_clusters',raster = T,shuffle = T, label.size = 2.5, pt.size = 2.5) + theme(legend.position="bottom")+ggtitle(paste0(sample))
+)
+  for (score in c(colnames(seurat_list[[sample]]@meta.data)[12:length(colnames(seurat_list[[sample]]@meta.data))])){
+    print(FeaturePlot(object = seurat_list[[sample]], features = score)+ scale_colour_gradientn(colours = rev(brewer.pal(n = 11, name = "RdBu"))) +ggtitle(paste0(score, " for ", sample)))
+    }
+}
+dev.off()
+
+s = "B Cells"
+new.cluster.ids <- c("Memory B Cells", "Memory B Cells", "Naive B Cells", "Memory B Cells", "Activated B Cells", "Follicular B Cells", "Naive B Cells", "Activated B Cells", "Follicular B Cells")
+names(new.cluster.ids) <- levels(seurat_list[[s]])
+seurat_list[[s]] <- RenameIdents(seurat_list[[s]], new.cluster.ids)
+seurat_list[[s]]$sub_celltype <- Idents(seurat_list[[s]])
+saveRDS(seurat_list[[s]], "/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/SC164Bcells.rds")
+
+s = "T Cells"
+new.cluster.ids <- c("CD4/8 NaiveLike", "Treg", "CD8 T Cells", "CD8 Tex","CD8 Effector Memory", "Naive-Stem-Like", "CD8 T Cells", "CD4+ Helper T Lymphocytes","CD4+ Helper T Lymphocytes", "CD8 T Cells", "CD4+ Helper T Lymphocytes", "Other T Cells","Other T Cells")
+names(new.cluster.ids) <- levels(seurat_list[[s]])
+seurat_list[[s]] <- RenameIdents(seurat_list[[s]], new.cluster.ids)
+seurat_list[[s]]$sub_celltype <- Idents(seurat_list[[s]])
+saveRDS(seurat_list[[s]], "/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/SC164Tcells.rds")
+
+s = "Myeloid"
+new.cluster.ids <- c("Granulocytes", "Alveolar Macrophages", "Granulocytes", "Granulocytes","Monocytes Apobec3b", "CD16 C1qa Monocytes", "Monocytes Apobec3b", "Alveolar Macrophages","Monocytes Apobec3b", "Monocytes", "Monocytes Apobec3a", "Monocytes Apobec3a")
+names(new.cluster.ids) <- levels(seurat_list[[s]])
+seurat_list[[s]] <- RenameIdents(seurat_list[[s]], new.cluster.ids)
+seurat_list[[s]]$sub_celltype <- Idents(seurat_list[[s]])
+saveRDS(seurat_list[[s]], "/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/SC164Myeloid.rds")
+table(seurat_list[[s]]$sub_celltype)
+
+s <- readRDS("/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/SC164Myeloid.rds")
+#Idents(s) <- s$seurat_clusters
+myeloid_markers <- FindAllMarkers(s, only.pos = TRUE)
+write.csv(myeloid_markers, "/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/immune_subclustering/SC164Myeloid_pos_markers.csv")
+s <- readRDS("/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/SC164Tcells.rds")
+#Idents(s) <- s$seurat_clusters
+tcell_markers <- FindAllMarkers(s, only.pos = TRUE)
+write.csv(tcell_markers, "/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/immune_subclustering/SC164Tcell_pos_markers.csv")
+s <- readRDS("/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/SC164Bcells.rds")
+#Idents(s) <- s$seurat_clusters
+bcell_markers <- FindAllMarkers(s, only.pos = TRUE)
+write.csv(bcell_markers, "/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/immune_subclustering/SC164Bcell_pos_markers.csv")
+
+pdf("/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/immune_subclustering/SC164immune_clusters.pdf")
+s <- "B Cells"
+DimPlot(seurat_list[[s]], label = F, group.by = 'sub_celltype')+ggtitle("B Cells")
+s <- "T Cells"
+DimPlot(seurat_list[[s]], label = F, group.by = 'sub_celltype')+ggtitle("T Cells")
+s <- "Myeloid"
+DimPlot(seurat_list[[s]], label = F, group.by = 'sub_celltype')+ggtitle("Myeloid")
+dev.off()
+
+
+```
+
+### MiloR for Ben's RO1
+
+
+```{r}
+
+
+# Define your mapping
+milo_mapping <-  c("SC164_6" = "4T1_Con",
+                   "SC164_10" = "4T1_shPTK2")
+
+pathofdata <- "~/Documents/jobwork/CUIMC/Dormancy/miloR_SC164/"
+#celltype <-'Myeloid'
+#celltype <-'T Cells'
+celltype <-'B Cells' 
+
+# Assuming `seurat_list` is a list containing your Seurat objects
+pbmc_small <- seurat_list[[celltype]]
+pbmc_small@meta.data$milo_map <- milo_mapping[pbmc_small@meta.data$sample]
+
+# Function to split samples into pseudo-samples
+split_samples <- function(meta_data, sample_col) {
+  meta_data <- meta_data %>%
+    group_by(!!sym(sample_col)) %>%
+    mutate(sudo_samples = paste0(!!sym(sample_col), ".", sample(1:2, n(), replace = TRUE)))
+  return(as.data.frame(meta_data))  # Convert to dataframe to retain rownames
+}
+
+# Apply the function to the meta data
+pbmc_small@meta.data <- split_samples(pbmc_small@meta.data, "sample")
+rownames(pbmc_small@meta.data) <- pbmc_small@meta.data$barcode_orig
+# Verify the new column
+head(pbmc_small@meta.data)
+
+# Create the Seurat object with the new sudo_samples column
+pbmc_small[['sudo_samples']] <- pbmc_small@meta.data$sudo_samples
+
+# Verify the pseudo-samples
+table(pbmc_small@meta.data$sample, pbmc_small@meta.data$sudo_samples)
+
+# Define the comparisons
+comparisons <- list(
+  c("4T1_Con", "4T1_shPTK2")
+)
+
+for (comparison in comparisons) {
+  # Subset the data for the comparison
+  pbmc_small_comp <- subset(pbmc_small, subset = milo_map %in% comparison)
+  
+  pbmc_small_comp[['barcodes']] <- rownames(pbmc_small_comp@meta.data)
+  
+  # Create a single cell experiment object
+  pbmc_small_sce <- as.SingleCellExperiment(pbmc_small_comp)
+  
+  # Run Milo for test
+  pbmc_small_milo <- Milo(pbmc_small_sce)
+  
+  # Build graph
+  traj_milo <- buildGraph(pbmc_small_milo, k = 50, d = 30)
+  
+  # Create neighborhoods
+  traj_milo <- makeNhoods(traj_milo, prop = 0.5, k = 50, d = 30, refined = TRUE)
+  
+  milo.meta <- pbmc_small_comp@meta.data
+  
+  # Count cells in neighborhoods
+  traj_milo <- countCells(traj_milo, meta.data = data.frame(colData(traj_milo)), sample = 'sudo_samples')
+  
+  traj_design <- as.data.frame(xtabs(~ milo_map + sudo_samples, data = milo.meta))
+  traj_design <- traj_design[traj_design$Freq > 0, ]
+  rownames(traj_design) <- traj_design$sudo_samples
+  traj_design <- traj_design[colnames(nhoodCounts(traj_milo)),]
+  
+  # Differential abundance testing
+  #traj_design <- traj_design %>% mutate(condition = factor(milo_map))
+  #design <- model.matrix(~ 0 + condition, data = traj_design)
+  #colnames(design) <- levels(traj_design$condition)
+  print(1)
+  milo.res <- testNhoods(traj_milo, design =~milo_map, design.df = traj_design)
+  print(2)
+  
+  #embryo_design and test neighborhoods
+  traj_milo <- calcNhoodDistance(traj_milo, d=30)
+  da_results <-milo.res
+
+  # Annotate neighborhoods
+  da_results <- annotateNhoods(traj_milo, da_results, coldata_col = "sub_celltype")
+
+  # Build neighborhood graph
+  traj_milo <- buildNhoodGraph(traj_milo)
+  
+  tumor_nontumor<-da_results
+  #N = 100
+  DF = tibble(Celltype = tumor_nontumor$Endothelials_groups,
+            logFC = tumor_nontumor$logFC,
+            SpatialFDR = tumor_nontumor$SpatialFDR,
+            PValue = tumor_nontumor$PValue,
+            nh_size = colSums(nhoods(traj_milo)),
+            Nhood = tumor_nontumor$Nhood)#,
+
+  
+  da_results$nh_size = colSums(nhoods(traj_milo)) 
+  
+  # Save the results
+  comparison_name <- paste(comparison, collapse = "_vs_")
+  write.csv(da_results, file = paste0(pathofdata, comparison_name, '.', celltype, '.milo_da_results.csv'))
+  
+  # Visualization
+  print(3)
+  pdf(file=paste0(pathofdata,comparison[1], ".vs.", comparison[2],'.',celltype,'.v2.4.1.milo_da_results_plotDAbeeswarm_k50d30.1.pdf'),height=10,width=15)
+  p<-median_logFC <- median(da_results$logFC)
+  
+  # Create a new variable to indicate the color based on both PValue and logFC
+  da_results$color <- ifelse(da_results$PValue < 0.05 & da_results$logFC > median_logFC, "blue", 
+                              ifelse(da_results$PValue < 0.05 & da_results$logFC <= median_logFC, "red", "grey"))
+  
+  # Plot with the new color variable
+  print(ggplot(da_results, aes(x = logFC, y = sub_celltype)) +
+    geom_violin(fill = "grey", scale = 'width', alpha = 0) + # Set fill color to grey
+    geom_jitter(aes(size = nh_size, color = color), alpha = 0.5)+# Overlay colored points
+    scale_color_identity() + # Use identity scale since color is pre-defined
+    ggtitle(paste0(comparison[1], " vs ", comparison[2], " \nPositive Log2FC = Enriched in ", comparison[1], " \nNegative Log2FC = Enriched in ", comparison[2])) +
+    theme_minimal())
+  
+  dev.off()
+  print(4)
+}
+
+#d10_m <- read.csv("/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/miloR/4T07-shTBK1-D20_vs_4T07-WT-D20.Myeloid.milo_da_results.csv")
+#d10_t <- read.csv("/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/miloR/4T07-shTBK1-D20_vs_4T07-WT-D20.T Cells.milo_da_results.csv")
+#
+#da_results <- bind_rows(d10_m, d10_t)
+#comparison <- c("4T07-shTBK1-D20", "4T07-WT-D20")
+#
+#pdf(file=paste0(pathofdata,comparison[1], ".vs.", comparison[2],'.all_cells.v2.4.1.milo_da_results_plotDAbeeswarm_k50d30.1.pdf'),height=10,width=15)
+#p<-median_logFC <- median(da_results$logFC)
+#
+## Create a new variable to indicate the color based on both PValue and logFC
+#da_results$color <- ifelse(da_results$PValue < 0.05 & da_results$logFC > median_logFC, "blue", 
+#                            ifelse(da_results$PValue < 0.05 & da_results$logFC <= median_logFC, "red", "grey"))
+#
+## Plot with the new color variable
+#print(ggplot(da_results, aes(x = logFC, y = celltype)) +
+#  geom_violin(fill = "grey", scale = 'width', alpha = 0) + # Set fill color to grey
+#  geom_jitter(aes(size = nh_size, color = color), alpha = 0.5)+# Overlay colored points
+#  scale_color_identity() + # Use identity scale since color is pre-defined
+#  ggtitle(paste0(comparison[1], " vs ", comparison[2], " \nPositive Log2FC = Enriched in ", comparison[1], " \nNegative Log2FC = Enriched in ", comparison[2])) +
+#  theme_minimal())
+#
+#dev.off()
+
+```
+
+
+### GSEA
+
+```{r}
+library(enrichR)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(readxl)
+library(clusterProfiler)
+library(enrichplot)
+listEnrichrSites()
+setEnrichrSite("Enrichr") # Human genes
+websiteLive <- TRUE
+dbs <- listEnrichrDbs()
+if (is.null(dbs)) websiteLive <- FALSE
+if (websiteLive) head(dbs)
+
+dbs <- c("MSigDB_Hallmark_2020","GO_Biological_Process_2021")
+
+top_B_markers <- bcell_markers %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 50)
+
+
+top_T_markers <-tcell_markers %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 50)
+
+top_M_markers <-myeloid_markers %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 50)
+
+monos <- subset(seurat_list[["Myeloid"]], subset = (celltype == "Monocytes Apobec3b")|(celltype == "Monocytes Apobec3a")|(celltype == "Monocytes")|(celltype == "Monocytes CD14")|(celltype == "Monocytes CD16"))
+mono_deg_results <- FindAllMarkers(monos, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+top_mono_markers <- mono_deg_results %>% group_by(cluster) %>% top_n(n = 15, wt = avg_log2FC)
+pdf("mono.pdf", width = 18)
+DotPlot(monos, features = unique(top_mono_markers$gene)) + RotatedAxis()
+dev.off()
+for (clus in levels(top_mono_markers$cluster)){
+  top <- top_mono_markers[top_mono_markers$cluster == clus,]
+  if (websiteLive) {
+    enriched <- enrichr(top$gene, dbs)
+  }
+  enrichment <- rbind(enriched[1]$MSigDB_Hallmark_2020, enriched[2]$GO_Biological_Process_2021)
+  enrichment <- enrichment[order(enrichment$Adjusted.P.value, decreasing = FALSE), ]
+  enrichment$Term <- gsub("\\s*\\(.*", "", enrichment$Term)
+  enrichment$Count <- str_count(enrichment$Genes, ";") + 1
+  
+  h_mut_enr<-head(enrichment, 20)
+  h_mut_enr$GeneRatio <- c(sapply(h_mut_enr$Overlap, function(x) eval(parse(text=x))))
+  
+  cairo_pdf(paste0(gsub(" ", "_", gsub("/", "_", clus)), ".pdf"), width = 18, height = 10)
+  print(ggplot(h_mut_enr, aes(x = GeneRatio, y = factor(Term, levels = rev(h_mut_enr$Term)))) + 
+  geom_point(aes(size = Count, color = Adjusted.P.value)) +
+  scale_size_continuous(range = c(1, 10)) + # Adjust the range of dot sizes as needed
+  #scale_color_manual(name = "Adjusted P Value", values = c("red", "blue"), labels = c("≤0.05", ">0.05")) +
+  theme_bw(base_size = 14) +scale_color_gradient(low = "red", high = "blue") + 
+  ylab(NULL) +
+  ggtitle(paste0("Hallmark Pathway Enrichment for ",clus)))
+  dev.off()
+
+}
+
+
+pdf("/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/GSEA/dot_plots.pdf")
+DotPlot(seurat_list[["T Cells"]], features = str_to_title(c("PTPRC", "ITGAM", "IL7R", "TCF7", 'CD4', "IFNG", "CCL5", "CD8A", "KLRBLC", "NCR1", "ITGA2", "foxp3", "tnfrsf18")))+coord_flip()+theme(axis.text.x = element_text(angle = 60, vjust = 1, hjust=1)) + ggtitle("T Cells")
+DotPlot(seurat_list[["Myeloid"]], features = str_to_title(c("PTPRC", "ITGAM", "CX3CR1", "LY6C1", "MRC1", "ADGRE1", "SIGLECF", "CD14", "LY6G")))+coord_flip()+theme(axis.text.x = element_text(angle = 60, vjust = 1, hjust=1))+ ggtitle("Myeloid Cells")
+DotPlot(monos, features = str_to_title(c('CCR2', 'CCR5', 'SELL', 'SPN', 'TREML4', 'CD209A', 'H2-Q7', 'H2-T23')))+coord_flip()+theme(axis.text.x = element_text(angle = 60, vjust = 1, hjust=1))+ ggtitle("Monocytes")
+DotPlot(monos, features = str_to_title(c('S100A6', 'S100A8', 'S100A9', 'S100A11', 'ARG1', 'TGFB1', 'CCL17', 'CLEC10A',
+                                         'TNF', 'IL1B', 'IL1A', 'IL6', 'IL15', 'CCL2', 'CD80', 'CD86', 'CCL3', 'CD36')))+coord_flip()+theme(axis.text.x = element_text(angle = 60, vjust = 1, hjust=1))+ ggtitle("Monocytes")
+dev.off()
+
+```
+
+
+### spp1
+
+```{r}
+integrated_seurat_object <- readRDS('/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/SC164Myeloid.rds')
+group_mapping <- c("SC164_6" = "4T1_Con",
+                   "SC164_10" = "4T1_shPTK2")
+
+# Add group information to ID_major column
+integrated_seurat_object@meta.data$ID_major <- group_mapping[integrated_seurat_object@meta.data$sample] 
+table(integrated_seurat_object$ID_major)
+
+# Subset data by time points
+time_points <- unique(integrated_seurat_object$ID_major)
+expression_data <- list()
+
+for (time in time_points) {
+  subset_data <- subset(integrated_seurat_object, subset = ID_major == time)
+  expression_data[[time]] <- FetchData(subset_data, vars = "Spp1")
+}
+pdf('/Users/zackbrodtman/Documents/jobwork/CUIMC/Dormancy/SC164_Spp1.pdf', width = 14)
+# Visualize SPP1 expression across time points
+VlnPlot(integrated_seurat_object, features = "Spp1", group.by = "ID_major")
+DimPlot(integrated_seurat_object, group.by = 'sub_celltype')
+FeaturePlot(integrated_seurat_object, features = "Spp1", split.by = "ID_major")
+
+
+
+dev.off()
+
+```
